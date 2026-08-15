@@ -1,0 +1,680 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# tcr — Task CPU Restricted
+#
+# Ejecuta un comando restringido a un subconjunto seguro de CPUs (excluyendo
+# siempre los núcleos de rendimiento de mayor frecuencia, que en Android
+# pueden matar el proceso), con nice 19 (prioridad mínima) e ionice idle
+# (si existe). Pensado para builds/tareas pesadas en Termux sin que el OOM
+# killer mate el proceso principal de Termux.
+#
+# NOTA: ulimit -v y la flag --mem se ELIMINARON a petición del usuario: el
+# kernel de este dispositivo acepta setear el límite pero es inaplicable
+# (VSZ ~10.8 GB y el soft limit no puede subirse después -> ENOMEM en
+# cualquier exec). La protección anti-OOM corre a cargo de nice + ionice +
+# exclusión de cores de rendimiento.
+#
+# Uso:
+#   tcr <cmd...>          Ejecuta el comando con las restricciones de tcr
+#   tcr -n N <cmd...>     Valor nice (default 19, prioridad mínima)
+#   tcr -o <adj> <cmd...> oom_score_adj del build (default 1000; -1000..1000)
+#   tcr -j <N> <cmd...>   jobs fijos (default: min(CPUs grupo, RAM/1.5GB))
+#   tcr -m <MB> <cmd...>  OOM guard: mata el build si su RSS total supera MB (default: inactivo)
+#   tcr -r <MB> <cmd...>  RAM guard: mata el build si la RAM libre del sistema cae bajo MB (default: inactivo)
+#   tcr -- <cmd...>       Marca el final de los flags
+#   tcr -h | --help       Muestra esta ayuda
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+STATE_DIR="${TMPDIR:-$PREFIX/tmp}"
+
+usage() {
+    # Destino: "out" -> stdout (para -h/--help, rc 0); cualquier otro -> stderr
+    local dest=2
+    [ "$1" = "out" ] && dest=1
+    cat >&"$dest" <<'EOF'
+tcr — ejecuta un comando restringido a CPUs seguros y baja prioridad.
+
+Uso:
+  tcr <cmd...>          Ejecuta el comando con las restricciones de tcr
+  tcr -n N <cmd...>     Valor nice (default 19, prioridad mínima)
+  tcr -o <adj> <cmd...> oom_score_adj del build (default 1000; -1000..1000)
+  tcr -j <N> <cmd...>   jobs fijos (default: min(CPUs grupo, RAM/1.5GB))
+  tcr -m <MB> <cmd...>  OOM guard: mata el build si su RSS total supera MB (default: inactivo)
+  tcr -r <MB> <cmd...>  RAM guard: mata el build si la RAM libre del sistema cae bajo MB (default: inactivo)
+  tcr -- <cmd...>       Marca el final de los flags
+  tcr -h | --help       Muestra esta ayuda
+
+Sin argumentos o con un flag desconocido: error + uso en stderr, exit 2.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 0) Parse de la línea de comandos
+# ---------------------------------------------------------------------------
+# FIX 6: rechazar argumentos vacíos (p. ej. `tcr ""` o `tcr -- ""`)
+for _a in "$@"; do
+    if [ -z "$_a" ]; then
+        echo "[tcr] error: argumento vacío no permitido" >&2
+        usage
+        exit 2
+    fi
+done
+
+NICE_VAL=19
+OOM_ADJ=1000           # oom_score_adj del build (default 1000; -1000..1000)
+FIXED_JOBS=""          # -j <N>: jobs fijos (si vacío, se auto-calculan)
+MEM_LIMIT=""           # -m <MB>: OOM guard (si vacío, monitor inactivo)
+RAM_RESERVE_MB=""      # -r <MB>: RAM guard del sistema (si vacío, monitor inactivo)
+cmd=()
+
+# Parseo de flags: solo se interpretan ANTES del primer argumento no-flag
+# (que inicia el comando a ejecutar). Así `tcr bash -c 'nproc'` no confunde
+# el `-c` del comando con un flag de tcr.
+parsing=1
+while [ $# -gt 0 ]; do
+    if [ "$parsing" -eq 1 ]; then
+        case "$1" in
+            -h|--help)
+                usage out
+                exit 0
+                ;;
+            -n)
+                if [ $# -lt 2 ]; then
+                    echo "[tcr] error: -n requiere un valor entero" >&2
+                    usage
+                    exit 2
+                fi
+                shift
+                NICE_VAL="$1"
+                if ! [[ "$NICE_VAL" =~ ^-?[0-9]+$ ]]; then
+                    echo "[tcr] error: -n debe ser un entero" >&2
+                    exit 2
+                fi
+                if [ "$NICE_VAL" -lt -20 ] || [ "$NICE_VAL" -gt 19 ]; then
+                    echo "[tcr] error: -n debe estar entre -20 y 19" >&2
+                    usage
+                    exit 2
+                fi
+                ;;
+            -o)
+                if [ $# -lt 2 ]; then
+                    echo "[tcr] error: -o requiere un valor entero" >&2
+                    usage
+                    exit 2
+                fi
+                shift
+                OOM_ADJ="$1"
+                if ! [[ "$OOM_ADJ" =~ ^-?[0-9]+$ ]] || [ "$OOM_ADJ" -lt -1000 ] || [ "$OOM_ADJ" -gt 1000 ]; then
+                    echo "[tcr] error: -o debe ser un entero entre -1000 y 1000" >&2
+                    usage
+                    exit 2
+                fi
+                ;;
+            -j)
+                if [ $# -lt 2 ]; then
+                    echo "[tcr] error: -j requiere un valor entero" >&2
+                    usage
+                    exit 2
+                fi
+                shift
+                FIXED_JOBS="$1"
+                if ! [[ "$FIXED_JOBS" =~ ^[0-9]+$ ]] || [ "$FIXED_JOBS" -lt 1 ]; then
+                    echo "[tcr] error: -j debe ser un entero >= 1" >&2
+                    usage
+                    exit 2
+                fi
+                ;;
+            -m)
+                if [ $# -lt 2 ]; then
+                    echo "[tcr] error: -m requiere un valor entero" >&2
+                    usage
+                    exit 2
+                fi
+                shift
+                MEM_LIMIT="$1"
+                if ! [[ "$MEM_LIMIT" =~ ^[0-9]+$ ]] || [ "$MEM_LIMIT" -lt 1 ]; then
+                    echo "[tcr] error: -m debe ser un entero >= 1 (MB)" >&2
+                    usage
+                    exit 2
+                fi
+                ;;
+            -r)
+                if [ $# -lt 2 ]; then
+                    echo "[tcr] error: -r requiere un valor entero" >&2
+                    usage
+                    exit 2
+                fi
+                shift
+                RAM_RESERVE_MB="$1"
+                if ! [[ "$RAM_RESERVE_MB" =~ ^[0-9]+$ ]] || [ "$RAM_RESERVE_MB" -lt 1 ]; then
+                    echo "[tcr] error: -r debe ser un entero >= 1 (MB)" >&2
+                    usage
+                    exit 2
+                fi
+                ;;
+            --)
+                parsing=0
+                ;;
+            -*)
+                echo "[tcr] error: flag desconocido: $1" >&2
+                usage
+                exit 2
+                ;;
+            *)
+                parsing=0
+                cmd+=("$1")
+                ;;
+        esac
+    else
+        cmd+=("$1")
+    fi
+    shift
+done
+
+if [ ${#cmd[@]} -eq 0 ]; then
+    echo "[tcr] error: no se indicó ningún comando" >&2
+    usage
+    exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# 1) Detección de CPUs seguros (adaptativa por frecuencia)
+# ---------------------------------------------------------------------------
+declare -a FREQ=()
+for _f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
+    [ -r "$_f" ] || continue
+    _cpu=${_f#/sys/devices/system/cpu/cpu}
+    _cpu=${_cpu%%/*}
+    _val=$(cat "$_f" 2>/dev/null)
+    _val="${_val//[[:space:]]/}"
+    [[ "$_val" =~ ^[0-9]+$ ]] || continue
+    FREQ[$_cpu]=$_val
+done
+
+CPU_IDS=()
+for _i in "${!FREQ[@]}"; do CPU_IDS+=("$_i"); done
+CPU_IDS=($(printf '%s\n' "${CPU_IDS[@]}" | sort -n))
+
+if [ ${#CPU_IDS[@]} -eq 0 ]; then
+    # Fallback 1: no se pudo leer ninguna frecuencia
+    echo "[tcr] aviso: no se pudo leer ninguna frecuencia de CPU; usando grupos fijos (fallback)" >&2
+    _n=0
+    while [ -d "/sys/devices/system/cpu/cpu$_n" ]; do _n=$((_n + 1)); done
+    [ "$_n" -gt 6 ] && _n=6
+    SAFE=()
+    for ((_i = 0; _i < _n; _i++)); do SAFE+=("$_i"); done
+else
+    MAX_FREQ=0
+    for _i in "${CPU_IDS[@]}"; do
+        [ "${FREQ[$_i]}" -gt "$MAX_FREQ" ] && MAX_FREQ="${FREQ[$_i]}"
+    done
+    # Caso homogéneo: TODOS los CPUs con la misma frecuencia -> no excluir ninguno
+    _homogeneous=1
+    for _i in "${CPU_IDS[@]}"; do
+        [ "${FREQ[$_i]}" -eq "$MAX_FREQ" ] || { _homogeneous=0; break; }
+    done
+    if [ "$_homogeneous" -eq 1 ]; then
+        SAFE=("${CPU_IDS[@]}")
+    else
+        # Excluir TODOS los CPUs cuya frecuencia == la máxima (cores de rendimiento)
+        SAFE=()
+        for _i in "${CPU_IDS[@]}"; do
+            [ "${FREQ[$_i]}" -eq "$MAX_FREQ" ] || SAFE+=("$_i")
+        done
+    fi
+fi
+
+# Dividir en 2 grupos balanceados (primera mitad -> A, segunda -> B)
+_N=${#SAFE[@]}
+_HALF=$(((_N + 1) / 2))
+A_CPUS=("${SAFE[@]:0:_HALF}")
+B_CPUS=("${SAFE[@]:_HALF}")
+# Protección ante casos patológicos (1 solo núcleo seguro): ambos grupos -> mismo núcleo
+if [ ${#A_CPUS[@]} -eq 0 ]; then A_CPUS=("${B_CPUS[@]}"); fi
+if [ ${#B_CPUS[@]} -eq 0 ]; then B_CPUS=("${A_CPUS[@]}"); fi
+
+join_comma() { local IFS=','; printf '%s' "$*"; }
+A_LIST=$(join_comma "${A_CPUS[@]}")
+B_LIST=$(join_comma "${B_CPUS[@]}")
+
+echo "[tcr] CPUs seguros: A=$A_LIST B=$B_LIST" >&2
+
+# ---------------------------------------------------------------------------
+# 2) Cola de espera + alternancia (contador persistente + lockfiles)
+# ---------------------------------------------------------------------------
+COUNTER_FILE="$STATE_DIR/tcr.counter"
+LOCK_A="$STATE_DIR/tcr.lock.A"
+LOCK_B="$STATE_DIR/tcr.lock.B"
+
+counter=0
+if [ -f "$COUNTER_FILE" ]; then
+    counter=$(cat "$COUNTER_FILE" 2>/dev/null)
+    [[ "$counter" =~ ^[0-9]+$ ]] || counter=0
+fi
+
+# Adquisición atómica: subshell con noclobber; falla si el lockfile ya existe.
+# Códigos de retorno:
+#   0 -> lock adquirido
+#   1 -> Ocupado por un proceso vivo (COLA LEGÍTIMA; el bucle espera
+#        INDEFINIDAMENTE, sin tope de intentos)
+#   2 -> stale limpiado (PID muerto o contenido inválido); el bucle debe
+#        REINTENTAR el mismo grupo
+#   3 -> fallo de CREACIÓN (tras el intento noclobber el archivo NO existe =
+#        STATE_DIR no escribible / FS read-only). ÚNICO caso que dispara
+#        el bail-out de FIX 5.
+acquire_lock() {
+    local lf="$1"
+    local pid
+    if ( set -o noclobber; printf '%s\n' "$$" > "$lf" ) 2>/dev/null; then
+        return 0
+    fi
+    if [ ! -e "$lf" ]; then
+        # El noclobber falló y el archivo NO existe: no se pudo crear
+        return 3
+    fi
+    pid=$(cat "$lf" 2>/dev/null)
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        return 1   # ocupado por un proceso vivo
+    fi
+    rm -f "$lf" 2>/dev/null   # stale: se borra; el llamador reintentará este grupo
+    return 2
+}
+
+# FIX 3: incremento del contador persistente SERIALIZADO con un lock dedicado
+# ($STATE_DIR/tcr.counter.lock) usando el MISMO patrón noclobber. La ventana
+# de contención queda limitada al incremento (read-modify-write), no a toda
+# la ejecución. Reintento breve: hasta 50 x 0.1s = ~5s.
+increment_counter() {
+    local lock="$STATE_DIR/tcr.counter.lock"
+    local tries=0 cpid c=0
+    while ! ( set -o noclobber; printf '%s\n' "$$" > "$lock" ) 2>/dev/null; do
+        # Auto-cura del lock corrupto (MINOR): si el archivo EXISTE, se
+        # considera stale (y se elimina) cuando su contenido no es un PID
+        # numérico (ej. "xyz" o vacío) o el PID está muerto — igual que hace
+        # acquire_lock. El guard [ -e ] evita tratar el fallo de creación
+        # (archivo inexistente = FS no escribible) como stale.
+        if [ -e "$lock" ]; then
+            cpid=$(cat "$lock" 2>/dev/null)
+            if ! [[ "$cpid" =~ ^[0-9]+$ ]] || ! kill -0 "$cpid" 2>/dev/null; then
+                rm -f "$lock" 2>/dev/null   # stale/corrupto: se limpia y se reintenta
+                continue
+            fi
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            echo "[tcr] error: no se pudo adquirir el lock del contador tras ~5s" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    if [ -f "$COUNTER_FILE" ]; then
+        c=$(cat "$COUNTER_FILE" 2>/dev/null)
+        [[ "$c" =~ ^[0-9]+$ ]] || c=0
+    fi
+    c=$((c + 1))
+    # Persistencia atómica: tmp + mv
+    printf '%s\n' "$c" > "$STATE_DIR/tcr.counter.$$" 2>/dev/null
+    mv -f "$STATE_DIR/tcr.counter.$$" "$COUNTER_FILE" 2>/dev/null
+    counter="$c"
+    # Liberar el lock del contador SOLO si sigue siendo nuestro (nunca pisar ajeno)
+    if [ "$(cat "$lock" 2>/dev/null)" = "$$" ]; then
+        rm -f "$lock" 2>/dev/null
+    fi
+}
+
+# Preferencia inicial: grupo A si contador par, grupo B si impar
+PREF_NAME="A"; OTHER_NAME="B"
+if [ $((counter % 2)) -eq 1 ]; then
+    PREF_NAME="B"; OTHER_NAME="A"
+fi
+PREF_LOCK="$STATE_DIR/tcr.lock.$PREF_NAME"
+OTHER_LOCK="$STATE_DIR/tcr.lock.$OTHER_NAME"
+
+MY_GROUP=""
+MY_LOCK=""
+_attempts=0
+while [ -z "$MY_GROUP" ]; do
+    acquire_lock "$PREF_LOCK"
+    _pref_rc=$?
+    if [ "$_pref_rc" -eq 0 ]; then
+        MY_GROUP="$PREF_NAME"
+        MY_LOCK="$PREF_LOCK"
+        continue
+    fi
+    # FIX 4: stale en el grupo preferido -> reintentar el PREFERIDO en la
+    # siguiente iteración (en vez de caer al otro grupo en esta misma)
+    if [ "$_pref_rc" -eq 2 ]; then
+        continue
+    fi
+    acquire_lock "$OTHER_LOCK"
+    _oth_rc=$?
+    if [ "$_oth_rc" -eq 0 ]; then
+        MY_GROUP="$OTHER_NAME"
+        MY_LOCK="$OTHER_LOCK"
+        continue
+    fi
+    if [ "$_oth_rc" -eq 2 ]; then
+        continue
+    fi
+    # FIX 5 (CORREGIDO, bug MAJOR): el bail-out SOLO aplica al fallo de
+    # CREACIÓN del lock (rc=3: STATE_DIR no escribible / FS read-only).
+    # rc=1 (grupo ocupado por un proceso vivo) es la COLA LEGÍTIMA y se
+    # espera INDEFINIDAMENTE sin tope. Antes, _attempts se incrementaba con
+    # cualquier rc=1 y un tercer tcr en cola abortaba a los ~5s (falso
+    # positivo con mensaje engañoso de "no escribible").
+    if [ "$_pref_rc" -eq 3 ] || [ "$_oth_rc" -eq 3 ]; then
+        _attempts=$((_attempts + 1))
+        if [ "$_attempts" -ge 5 ]; then
+            echo "[tcr] error: no se pudo adquirir un grupo de CPUs tras 5 intentos (¿$STATE_DIR no escribible?)" >&2
+            exit 1
+        fi
+    fi
+    sleep 1
+done
+
+# Limpieza garantizada: EXIT siempre limpia el lock propio; TERM/INT además
+# matan el grupo de procesos del comando (FIX 1) ANTES de liberar el lock.
+# Se instala aquí para cubrir también la ventana del incremento del contador.
+CHILD_PID=""
+KILLED=0
+cleanup() {
+    if [ "$KILLED" = "1" ] && [ -n "$CHILD_PID" ]; then
+        # Matar TODO el grupo de procesos del comando. El comando se lanzó con
+        # `setsid`, así que es líder de sesión y su PGID == su PID.
+        kill -- -"$CHILD_PID" 2>/dev/null
+        # Espera breve (hasta ~2s) a que muera el líder del grupo
+        for _s in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$CHILD_PID" 2>/dev/null || break
+            sleep 0.2
+        done
+        # Refuerzo: matar descendientes que ignoren TERM
+        kill -9 -- -"$CHILD_PID" 2>/dev/null
+        CHILD_PID=""
+    fi
+    # FIX 2: solo borrar el lock si sigue siendo NUESTRO. Tras la limpieza
+    # explícita se vacía MY_LOCK, así el trap EXIT es no-op (sin doble rm y
+    # sin borrar el lock de otro proceso que lo haya recreado).
+    if [ -n "$MY_LOCK" ]; then
+        rm -f "$MY_LOCK" 2>/dev/null
+        MY_LOCK=""
+    fi
+    rm -f "$STATE_DIR/tcr.counter.$$" 2>/dev/null
+}
+trap cleanup EXIT
+trap 'KILLED=1; cleanup; exit 1' TERM
+trap 'KILLED=1; cleanup; exit 1' INT
+
+# FIX 3: incrementar y persistir el contador (serializado) ANTES de ejecutar
+increment_counter
+
+echo "[tcr] grupo adquirido: $MY_GROUP (contador: $counter)" >&2
+
+MY_CPUS="$A_LIST"
+[ "$MY_GROUP" = "B" ] && MY_CPUS="$B_LIST"
+
+# ---------------------------------------------------------------------------
+# 3) Restricciones aplicadas al comando
+# ---------------------------------------------------------------------------
+# (ulimit -v / --mem ELIMINADOS: ver nota del header. La protección anti-OOM
+# corre a cargo de nice + ionice + exclusión de cores de rendimiento +
+# oom_score_adj del build (default 1000) + auto-limitación de jobs por RAM.)
+
+# FIX 7 (NUEVO): auto-limitación de jobs (siempre activa). El OOM killer de
+# Android dispara por presión de memoria GLOBAL; limitar los jobs de
+# compilación a lo que la RAM disponible soporta (~1.5 GB por job) y a las
+# CPUs del grupo adquirido reduce la probabilidad de OOM sin intervención.
+RAM_KB=""
+if [ -r /proc/meminfo ]; then
+    RAM_KB=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+fi
+if ! [[ "$RAM_KB" =~ ^[0-9]+$ ]]; then
+    # MemAvailable no existe en kernels antiguos: fallback a MemFree
+    RAM_KB=$(awk '/^MemFree:/{print $2}' /proc/meminfo 2>/dev/null)
+fi
+if [[ "$RAM_KB" =~ ^[0-9]+$ ]]; then
+    jobs_por_ram=$(( RAM_KB / (1500 * 1024) ))
+    [ "$jobs_por_ram" -lt 1 ] && jobs_por_ram=1
+else
+    # /proc/meminfo ilegible o no numérico: no limitar por RAM
+    jobs_por_ram=99
+fi
+
+# CPUs del grupo adquirido (afinidad real del build)
+if [ "$MY_GROUP" = "B" ]; then
+    cpus_grupo=${#B_CPUS[@]}
+else
+    cpus_grupo=${#A_CPUS[@]}
+fi
+
+# JOBS = min(cpus_grupo, jobs_por_ram), mínimo 1; -j N lo fija sin calcular
+if [ -n "$FIXED_JOBS" ]; then
+    JOBS="$FIXED_JOBS"
+else
+    JOBS=$(( cpus_grupo < jobs_por_ram ? cpus_grupo : jobs_por_ram ))
+    [ "$JOBS" -lt 1 ] && JOBS=1
+fi
+
+if [[ "$RAM_KB" =~ ^[0-9]+$ ]]; then
+    echo "[tcr] jobs: $JOBS (RAM disponible: $(( RAM_KB / 1024 )) MiB, CPUs grupo: $cpus_grupo)" >&2
+else
+    echo "[tcr] jobs: $JOBS (RAM disponible: desconocida, CPUs grupo: $cpus_grupo)" >&2
+fi
+echo "[tcr] env: CARGO_BUILD_JOBS=$JOBS MAKEFLAGS=-j$JOBS CMAKE_BUILD_PARALLEL_LEVEL=$JOBS NINJAJOBS=$JOBS" >&2
+
+# FIX 11 (NUEVO): RAM guard (-r <MB>). Log de arranque si está activo.
+if [ -n "$RAM_RESERVE_MB" ]; then
+    echo "[tcr] RAM guard: activo (mata el build si quedan < ${RAM_RESERVE_MB} MB libres en el sistema)" >&2
+fi
+
+# Exportar SIEMPRE las env vars de paralelismo (los builders las leen)
+export CARGO_BUILD_JOBS="$JOBS"
+export MAKEFLAGS="-j$JOBS"
+export CMAKE_BUILD_PARALLEL_LEVEL="$JOBS"
+export NINJAJOBS="$JOBS"
+export JOBS="$JOBS"
+
+# FIX M1: si el comando pasa un -j/--jobs explícito, ese prevalece sobre
+# MAKEFLAGS=-j$JOBS (el flag de línea de comandos tiene mayor precedencia que
+# la env var) y el límite de RAM de FIX 7 queda anulado sin que el usuario lo
+# sepa. Detección heurística: argumentos que empiezan por -j, exactamente
+# --jobs, o que empiezan por --jobs= (suficiente; no se buscan casos raros).
+for _jc in "${cmd[@]}"; do
+    if [[ "$_jc" == -j* ]] || [ "$_jc" = "--jobs" ] || [[ "$_jc" == --jobs=* ]]; then
+        echo "[tcr] aviso: el comando pasa un -j explícito, que anula el límite de RAM de $JOBS jobs (MAKEFLAGS tiene menor precedencia)" >&2
+        break
+    fi
+done
+
+# 3.1 ionice -c 3 (idle) solo si existe; si no, se omite silenciosamente
+IONICE_ARGS=()
+if command -v ionice >/dev/null 2>&1; then
+    IONICE_ARGS=(ionice -c 3)
+fi
+
+# FIX 1: lanzar el comando en su propio grupo de procesos con `setsid` (existe
+# en este dispositivo; verificado). Así `kill -- -$CHILD_PID` mata TODO el
+# árbol de procesos del comando (PGID == PID del líder de sesión). Si en otro
+# dispositivo faltara `setsid`, el fallback sería matar recursivamente los
+# descendientes con `pgrep -P`/`pkill -P` — aquí no es necesario.
+# (sin exec: el shell debe sobrevivir para limpiar el lockfile)
+setsid taskset -c "$MY_CPUS" nice -n "$NICE_VAL" "${IONICE_ARGS[@]}" "${cmd[@]}" &
+CHILD_PID=$!
+
+# FIX 8 (NUEVO): oom_score_adj del build. Se escribe tras lanzar el comando:
+# los descendientes (cargo→rustc→cc) heredan el adj por fork y persiste tras
+# exec. Si falla (permisos/kernel), se avisa y se CONTINÚA (nunca abortar).
+# El propio tcr NO cambia su adj: debe quedar en el default del entorno para
+# poder limpiar el lock si el OOM killer mata al build.
+if [ "$OOM_ADJ" -lt 0 ]; then
+    echo "[tcr] aviso: oom_score_adj negativo requiere CAP_SYS_RESOURCE; puede fallar en este dispositivo" >&2
+fi
+# Guard de proceso vivo: si el comando terminó al instante (p. ej. `true`),
+# CHILD_PID ya está muerto y el write de oom_score_adj fallaría (aviso ruidoso)
+# o, en teoría, caería sobre un PID reciclado. Solo se avisa si el proceso
+# seguía vivo y el write falló.
+if kill -0 "$CHILD_PID" 2>/dev/null; then
+    if ! echo "$OOM_ADJ" > "/proc/$CHILD_PID/oom_score_adj" 2>/dev/null; then
+        echo "[tcr] aviso: no se pudo ajustar oom_score_adj a $OOM_ADJ para el build" >&2
+    fi
+fi
+
+# FIX 9 (NUEVO): OOM guard (-m <MB>). PAGE_SIZE_KB se lee una vez de
+# /proc/self/smaps (KernelPageSize, en kB; legible sin root en Termux).
+# getconf no existe en Termux y el fallback fijo a 4K subestimaba el RSS 4x
+# en dispositivos con páginas de 16K.
+PAGE_SIZE_KB=$(awk '/^KernelPageSize:/{print $2; exit}' /proc/self/smaps 2>/dev/null)
+[[ "$PAGE_SIZE_KB" =~ ^[0-9]+$ ]] || PAGE_SIZE_KB=4
+
+# tree_rss_kb: RSS total (kB) del árbol de procesos del build vía BFS por ppid
+# desde CHILD_PID. Lee /proc/<pid>/stat (campo 4 = ppid, campo 24 = rss en
+# páginas; se descarta "pid (comm)" hasta el ÚLTIMO ') ' porque el nombre del
+# proceso puede contener espacios). Fallback a `ps -eo pid=,ppid=,rss=` (kB)
+# si /proc no expone el árbol (hidepid). Devuelve 0 + _rss_kb, o 1 si no se
+# pudo construir el árbol (el llamador desactiva el monitor, no aborta).
+tree_rss_kb() {
+    local -A _children=()
+    local -A _rss_pages=()
+    local _s _pid _ppid _rss _line _fields _root_ok=0 _c _k
+    for _s in /proc/[0-9]*/stat; do
+        [ -r "$_s" ] || continue
+        _line=$(cat "$_s" 2>/dev/null) || continue
+        _line="${_line##*) }"                      # descartar "pid (comm)"
+        _fields=(${_line// / })
+        [ ${#_fields[@]} -ge 22 ] || continue
+        _pid="${_s#/proc/}"; _pid="${_pid%%/*}"
+        _ppid="${_fields[1]}"
+        _rss="${_fields[21]}"
+        [[ "$_ppid" =~ ^[0-9]+$ ]] || continue
+        [[ "$_rss" =~ ^[0-9]+$ ]] || continue
+        _rss_pages[$_pid]=$_rss
+        _children[$_ppid]="${_children[$_ppid]:-} $_pid"
+        [ "$_pid" = "$CHILD_PID" ] && _root_ok=1
+    done
+    if [ "$_root_ok" -ne 1 ]; then
+        # Fallback a ps (rss en kB) si /proc está restringido (hidepid)
+        if command -v ps >/dev/null 2>&1; then
+            local -A _ps_child=() _ps_rss=()
+            _root_ok=0
+            while IFS= read -r _line; do
+                _fields=($_line)
+                [ ${#_fields[@]} -ge 3 ] || continue
+                [[ "${_fields[1]}" =~ ^[0-9]+$ ]] || continue
+                [[ "${_fields[2]}" =~ ^[0-9]+$ ]] || continue
+                _ps_child[${_fields[1]}]="${_ps_child[${_fields[1]}]:-} ${_fields[0]}"
+                _ps_rss[${_fields[0]}]=${_fields[2]}
+                [ "${_fields[0]}" = "$CHILD_PID" ] && _root_ok=1
+            done < <(ps -eo pid=,ppid=,rss= 2>/dev/null)
+            if [ "$_root_ok" -eq 1 ]; then
+                local -a _q=("$CHILD_PID")
+                local -A _seen=()
+                local _total=0
+                while [ ${#_q[@]} -gt 0 ]; do
+                    _c="${_q[0]}"; _q=("${_q[@]:1}")
+                    [ -n "${_seen[$_c]}" ] && continue
+                    _seen[$_c]=1
+                    _total=$((_total + ${_ps_rss[$_c]:-0}))
+                    for _k in ${_ps_child[$_c]:-}; do
+                        [ -n "${_seen[$_k]}" ] || _q+=("$_k")
+                    done
+                done
+                _rss_kb=$_total
+                return 0
+            fi
+        fi
+        return 1
+    fi
+    local -a _q=("$CHILD_PID")
+    local -A _seen=()
+    local _total=0
+    while [ ${#_q[@]} -gt 0 ]; do
+        _c="${_q[0]}"; _q=("${_q[@]:1}")
+        [ -n "${_seen[$_c]}" ] && continue
+        _seen[$_c]=1
+        _total=$((_total + ${_rss_pages[$_c]:-0}))
+        for _k in ${_children[$_c]:-}; do
+            [ -n "${_seen[$_k]}" ] || _q+=("$_k")
+        done
+    done
+    # páginas * PAGE_SIZE_KB (kB por página) = kB
+    _rss_kb=$(( _total * PAGE_SIZE_KB ))
+    return 0
+}
+
+# Esperar el comando y capturar su exit code.
+# IMPORTANTE: NO usar `wait` como espera principal: bash retrasa los traps de
+# SIGINT/SIGQUIT mientras espera a un hijo con `wait` (no ejecuta el trap
+# hasta que el hijo muere), lo que impediría matar el grupo a tiempo con
+# Ctrl-C. Con polling (kill -0 + sleep 0.1) el trap SIGINT corre con un
+# retraso máximo de ~0.1s. El `wait` final, al haberse detectado ya la muerte
+# del proceso, retorna al instante y devuelve el exit code real del comando.
+# El polling NO lleva tope: es la espera normal de tcr (el comando puede durar
+# lo que sea). El tope anti-cuelgue del trap —si el hijo no responde al kill
+# del grupo— está en cleanup(): ~2s de espera + kill -9, y el trap sale.
+_rss_iter=0
+_rss_warned=0
+_ram_warned=0
+while kill -0 "$CHILD_PID" 2>/dev/null; do
+    sleep 0.1
+    # FIX 10 (NUEVO): OOM guard. FIX 11 (NUEVO): RAM guard. Solo comprobar si
+    # -m o -r están activos (MEM_LIMIT/RAM_RESERVE_MB definidos): sin ambos el
+    # bucle es idéntico al original (cero latencia extra).
+    [ -z "$MEM_LIMIT" ] && [ -z "$RAM_RESERVE_MB" ] && continue
+    _rss_iter=$((_rss_iter + 1))
+    # Cada ~5 iteraciones (≈0.5 s) para no añadir overhead con lecturas /proc
+    [ $((_rss_iter % 5)) -ne 0 ] && continue
+    # RAM guard (-r <MB>): RAM libre del SISTEMA vía /proc/meminfo
+    # (MemAvailable, kB). Si cae bajo el umbral, se mata el build ANTES de que
+    # LMKD/PSI dispare el OOM killer. Si /proc no se puede leer, se degrada
+    # silenciosamente (un solo aviso; no se aborta el build por esto).
+    if [ -n "$RAM_RESERVE_MB" ]; then
+        _avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+        if [[ "$_avail_kb" =~ ^[0-9]+$ ]]; then
+            if [ "$_avail_kb" -lt $((RAM_RESERVE_MB * 1024)) ]; then
+                echo "[tcr] RAM guard: quedan menos de ${RAM_RESERVE_MB} MB libres en el sistema ($(( (_avail_kb + 1023) / 1024 )) MB); matando el build para proteger el sistema" >&2
+                # Matar TODO el grupo (mismo patrón que cleanup) y salir con 137
+                KILLED=1
+                cleanup
+                exit 137
+            fi
+        else
+            if [ "$_ram_warned" = "0" ]; then
+                echo "[tcr] aviso: no se pudo leer /proc/meminfo; monitor RAM guard desactivado" >&2
+                _ram_warned=1
+            fi
+            RAM_RESERVE_MB=""   # desactivar el monitor para esta ejecución (no abortar)
+        fi
+    fi
+    # OOM guard (-m <MB>): solo activo si MEM_LIMIT está definido, simétrico al
+    # guard del RAM guard. Sin -m no se ejecuta: con MEM_LIMIT vacío la
+    # aritmética evalúa 0 y mataría cualquier build con RSS > 0.
+    if [ -n "$MEM_LIMIT" ]; then
+        if tree_rss_kb; then
+            if [ "$_rss_kb" -gt $((MEM_LIMIT * 1024)) ]; then
+                echo "[tcr] OOM guard: el build superó ${MEM_LIMIT} MB de RSS ($(( (_rss_kb + 1023) / 1024 )) MB); matando el build" >&2
+                # Matar TODO el grupo (mismo patrón que cleanup) y salir con 137
+                KILLED=1
+                cleanup
+                exit 137
+            fi
+        else
+            # /proc no legible (hidepid) o el build terminó entre comprobaciones
+            if ! kill -0 "$CHILD_PID" 2>/dev/null; then
+                continue   # ya terminó: no avisar
+            fi
+            if [ "$_rss_warned" = "0" ]; then
+                echo "[tcr] aviso: no se pudo leer el árbol de procesos (¿/proc restringido?); monitor OOM desactivado" >&2
+                _rss_warned=1
+            fi
+            MEM_LIMIT=""   # desactivar el monitor para esta ejecución (no abortar)
+        fi
+    fi
+done
+wait "$CHILD_PID"
+RC=$?
+
+# Terminación NORMAL: el comando ya terminó (no hay grupo que matar), solo se
+# limpia el lock propio. Se vacía MY_LOCK para que el trap EXIT sea no-op y
+# no borre un lock que otro proceso pudiera haber creado (FIX 2, TOCTOU).
+rm -f "$MY_LOCK" 2>/dev/null
+MY_LOCK=""
+exit $RC
