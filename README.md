@@ -33,16 +33,42 @@ modo vigilancia los recoge).
 
 ## Instalación
 
-No requiere instalación: clona y usa.
+### Como comando global (recomendado)
 
 ```powershell
 git clone https://github.com/<tu-usuario>/tcr.git
 cd tcr
-.\tcr.ps1 doctor
+.\install.ps1
 ```
 
-Requiere PowerShell 5.1 (incluido en Windows 10 y 11). Para registrar la tarea
-programada o limitar procesos de otro usuario, ejecuta como administrador.
+Crea un lanzador en la primera carpeta del PATH que esté bajo tu perfil
+(por defecto `~\.local\bin`) y, si hace falta, la añade al PATH del usuario.
+A partir de ahí:
+
+```powershell
+tcr status
+tcr apply -Cores 2
+```
+
+El lanzador apunta al script del repositorio, no a una copia: el repo sigue
+siendo la única fuente de verdad. Si mueves el repo, define `TCR_HOME` con la
+nueva ruta o vuelve a ejecutar el instalador.
+
+Para registrar además la tarea programada, ejecuta el instalador desde un shell
+elevado o usa `-ConTarea`.
+
+### Sin instalar
+
+```powershell
+cd tcr
+.\tcr.ps1 status
+```
+
+### Requisitos
+
+PowerShell 5.1 (incluido en Windows 10 y 11). Para registrar la tarea
+programada o limitar procesos de otro usuario, hace falta ejecutar como
+administrador.
 
 Los datos de ejecución (configuración y registro) viven fuera del repo, en
 `%LOCALAPPDATA%\tcr\`, para que un clon no arrastre el estado de otra
@@ -252,7 +278,8 @@ física o en el BIOS.
 
 ```
 tcr/
-├── tcr.ps1              # punto de entrada (CLI)
+├── install.ps1           # instalador: crea el lanzador y ajusta el PATH
+├── tcr.ps1               # punto de entrada (CLI)
 ├── src/
 │   └── Tcr.psm1         # lógica: procesos, máscaras, límites, tarea programada
 ├── tools/

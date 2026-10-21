@@ -119,6 +119,49 @@ Un `LastTaskResult` distinto de `0` indica un fallo al arrancar.
 
 ---
 
+## `tcr` no se reconoce como comando
+
+El lanzador se crea en una carpeta del PATH, por defecto `~\.local\bin`. Tres
+comprobaciones:
+
+```powershell
+# 1. existe el lanzador
+Test-Path "$env:USERPROFILE\.local\bin\tcr.cmd"
+
+# 2. la carpeta esta en el PATH
+[Environment]::GetEnvironmentVariable('Path','User') -split ';' | Where-Object { $_ -like '*local\bin*' }
+
+# 3. se resuelve el comando
+Get-Command tcr
+```
+
+Si falla, vuelve a ejecutar el instalador:
+
+```powershell
+cd <ruta-del-repo>
+.\install.ps1
+```
+
+**Abre una terminal nueva** después de instalarlo: las terminales ya abiertas
+conservan el PATH con el que se arrancaron.
+
+---
+
+## El lanzador dice "no se encuentra tcr.ps1"
+
+El lanzador apunta al repositorio por ruta absoluta. Si moviste el repo:
+
+```powershell
+# opcion 1: variable de entorno
+[Environment]::SetEnvironmentVariable('TCR_HOME', 'C:\nueva\ruta\tcr', 'User')
+
+# opcion 2: reinstalar el lanzador
+cd <nueva-ruta-del-repo>
+.\install.ps1
+```
+
+---
+
 ## La máquina sigue caliente
 
 `tcr` reduce la carga de CPU, que es lo que dispara el ventilador. Pero si la

@@ -8,6 +8,10 @@ y este proyecto adheres a [Versionado Semántico](https://semver.org/lang/es/).
 ## [No publicado]
 
 ### Añadido
+- Instalador (`install.ps1`) que crea un lanzador `tcr` en una carpeta del PATH
+  y, si hace falta, añade esa carpeta al PATH del usuario. El lanzador apunta
+  al script del repositorio, no a una copia, de modo que el repositorio sigue
+  siendo la única fuente de verdad.
 - Mecanismo principal de límite por afinidad de CPU, con máscara de núcleos
   lógicos por proceso.
 - Límite opcional de CPU por porcentaje real mediante Job Object
