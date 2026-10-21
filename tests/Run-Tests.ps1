@@ -155,6 +155,25 @@ try {
     Remove-Item $ruta -Force -ErrorAction SilentlyContinue
 }
 
+# Regresion: enumerar las claves de un hashtable mientras se modifica lanza
+# "Coleccion modificada". Get-TcrConfig debe evitarlo.
+$rutaCfg = Join-Path $env:TEMP 'tcr-test-cfg-read.json'
+try {
+    $cfgPrueba | ConvertTo-Json -Depth 5 | Set-Content -Path $rutaCfg -Encoding UTF8
+    $raw = Get-Content $rutaCfg -Raw | ConvertFrom-Json
+    $copia = Get-TcrDefaultConfig
+    $errorAlCopiar = $null
+    try {
+        foreach ($p in @($copia.Keys)) {
+            if ($raw.PSObject.Properties.Name -contains $p) { $copia[$p] = $raw.$p }
+        }
+    } catch { $errorAlCopiar = $_.Exception.Message }
+    Write-Test -Nombre 'copiar claves de configuracion no lanza "Coleccion modificada"' `
+        -Ok ($null -eq $errorAlCopiar) -Detalle $errorAlCopiar
+} finally {
+    Remove-Item $rutaCfg -Force -ErrorAction SilentlyContinue
+}
+
 # ------------------------------------------------------------------ estado
 Section 'Reporte de estado'
 $status = Get-TcrStatus -Patterns @('opencode*', 'cline*', 'qodercli*')

@@ -144,8 +144,8 @@ switch ($Command) {
         Show-TcrHeader
         if ($changed) { Save-TcrConfig -Config $config }
         Write-Host ''
-        Write-Host ("  Nucleos por proceso : {0}" -f $(if($config.CpuCores -gt 0) { "$($config.CpuCores) de $($config.CpuCores -le 0)" } else { 'sin limite' }))
         $total = Get-TcrLogicalCpuCount
+        Write-Host ("  Nucleos por proceso : {0}" -f $(if($config.CpuCores -gt 0) { "$($config.CpuCores) de $total" } else { 'sin limite' }))
         Write-Host ("  Limite de CPU       : {0}" -f $(if($config.CpuCores -gt 0) { "max $([math]::Round($config.CpuCores / $total * 100))% de la maquina ($($config.CpuCores)/$total nucleos)" } else { 'sin limite' }))
         Write-Host ("  Tope Job Object      : {0}" -f $(if($config.JobCpuPercent -gt 0) { "$($config.JobCpuPercent)%" } else { 'no' }))
         Write-Host ("  Memoria por proceso  : {0}" -f $(if($config.MemoryMaxMB -gt 0) { "$($config.MemoryMaxMB) MB" } else { 'sin limite' }))

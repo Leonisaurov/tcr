@@ -258,7 +258,9 @@ function Get-TcrConfig {
         try {
             $raw = Get-Content $script:TcrConfig -Raw | ConvertFrom-Json
             $cfg = Get-TcrDefaultConfig
-            foreach ($p in $cfg.Keys) {
+            # No enumerar $cfg.Keys mientras se modifica: PowerShell lanza
+            # "Coleccion modificada". Se recorre una copia de las claves.
+            foreach ($p in @($cfg.Keys)) {
                 if ($raw.PSObject.Properties.Name -contains $p) { $cfg[$p] = $raw.$p }
             }
             return $cfg
