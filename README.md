@@ -255,18 +255,43 @@ tcr/
 ├── tcr.ps1              # punto de entrada (CLI)
 ├── src/
 │   └── Tcr.psm1         # lógica: procesos, máscaras, límites, tarea programada
+├── tools/
+│   └── hp-temp-monitor.ps1  # monitor de temperatura (solo lectura)
 ├── docs/
 │   ├── MECANISM.md      # detalle de los mecanismos de Windows
 │   └── TROUBLESHOOTING.md
 ├── tests/
 │   └── Run-Tests.ps1    # pruebas sin efectos secundarios
 ├── config/
-│   └── ejemplo.json     # configuración de referencia
+│   ├── ejemplo.json     # configuración de referencia
+│   └── esquema.config.json
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
 ├── LICENSE
 └── README.md
 ```
+
+---
+
+## Monitor de temperatura
+
+`tools/hp-temp-monitor.ps1` muestra la temperatura del chasis y del procesador
+en tiempo real. Es de solo lectura: no genera carga ni modifica nada.
+
+```powershell
+# Requiere privilegios de administrador: las zonas térmicas ACPI solo son
+# legibles por un proceso elevado.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\hp-temp-monitor.ps1
+```
+
+```
+  Hora      Chassis    CPU HP     Carga%
+  ------------------------------------------
+  19:52:12  85.1 C     85 C       76%
+  19:52:15  85.1 C     85 C       67%
+```
+
+Sin privilegios, las temperaturas salen `n/d` y el script lo avisa.
 
 ---
 
