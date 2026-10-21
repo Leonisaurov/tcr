@@ -44,6 +44,10 @@ cd tcr
 Requiere PowerShell 5.1 (incluido en Windows 10 y 11). Para registrar la tarea
 programada o limitar procesos de otro usuario, ejecuta como administrador.
 
+Los datos de ejecución (configuración y registro) viven fuera del repo, en
+`%LOCALAPPDATA%\tcr\`, para que un clon no arrastre el estado de otra
+instalación.
+
 ---
 
 ## Uso rápido
@@ -183,6 +187,9 @@ Detalles que costaron encontrar y que conviene documentar:
 - **`break` dentro de `Where-Object` corta el pipeline entero**, no solo el
   bucle interno. `tcr` evita ese patrón.
 
+- **Enumerar las claves de un hashtable mientras se modifica lanza "Colección
+  modificada".** `Get-TcrConfig` recorre una copia de la lista de claves.
+
 - **La estructura de CPU rate control debe medir exactamente 8 bytes.** Con un
   campo `Reserved` adicional (12 bytes) `SetInformationJobObject` falla con
   `ERROR_BAD_LENGTH` ("la longitud del comando es incorrecta").
@@ -194,6 +201,50 @@ Detalles que costaron encontrar y que conviene documentar:
 - **El vigilante detecta procesos por PID, no por línea de comandos.** Sin
   privilegios de administrador no se puede leer la línea de comandos de un
   proceso elevado, así que buscar por texto falla de forma silenciosa.
+
+- **Restaurar la afinidad completa necesita una máscara real.** La función que
+  construye la máscara devuelve cero cuando se piden todos los núcleos (eso
+  significa "sin límite" al aplicar), así que para restaurar hay una función
+  aparte.
+
+---
+
+## Contexto: por qué existe esta herramienta
+
+Nació de un caso concreto en una laptop HP 255R con Ryzen 3 7335U y 8 GB de RAM.
+Varios agentes de IA (opencode, cline, qodercli) se lanzaban desde la sesión
+y dejaban el equipo a 74 % de CPU y 85 °C, con el ventilador casi inaudible.
+
+Dos cosas se aprendieron por el camino y quedan documentadas aquí porque
+condicionan el diseño:
+
+**El consumo no está en el proceso principal.** El culprits era una cadena de
+hijos:
+
+```
+qodercli.exe → bash.exe → node.exe → node.exe → clang.exe ×2
+```
+
+Los agentes CLI lanzan compilaciones, y el trabajo pesado ocurre en los
+nietos. `tcr` busca por nombre de proceso, así que los cubre; el modo
+vigilancia recoge los que nacen después.
+
+**El ventilador no se puede controlar por software en estos equipos.** La API
+oficial de control térmico de HP (la misma que usa la app de HP para los modos
+Balanceado / Refrigeración / Rendimiento) responde "no soportado" en los modelos
+de consumo: el firmware no implementa el comando y la app oculta la tarjeta
+correspondiente. La curva de ventilador vive en el BIOS, sin interfaz de
+software.
+
+Para el ventilador, las palancas reales son:
+
+- **BIOS → Power → Thermal**, donde se fija la velocidad mínima.
+- **Limpieza física.** Si el equipo está a 50 °C en reposo, el problema es
+  polvo en el disipador o pasta térmica seca, no software.
+- **Reducir la carga**, que es lo que hace `tcr`.
+
+`tcr` ataca el tercer punto. El segundo y el primero requieren intervención
+física o en el BIOS.
 
 ---
 

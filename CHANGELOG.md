@@ -25,6 +25,16 @@ y este proyecto adheres a [Versionado Semántico](https://semver.org/lang/es/).
 - Documentación de los mecanismos de Windows y guía de resolución de problemas.
 - Esquema JSON de la configuración.
 
+### Corregido
+- `Get-TcrConfig` enumeraba las claves del hashtable mientras lo modificaba,
+  lo que lanzaba "Colección modificada" y hacía que la configuración se
+  descartara en silencio.
+- `Remove-TcrLimit` usaba la máscara de afinidad, que devuelve cero cuando se
+  piden todos los núcleos, por lo que restaurar la afinidad completa no tenía
+  efecto. Se añadió `Get-TcrFullAffinityMask`.
+- La estructura de CPU rate control debe medir exactamente 8 bytes y su nombre
+  de tipo chocaba con el de un campo.
+
 ### Notas
 - La estructura de CPU rate control debe medir exactamente 8 bytes; con un
   campo `Reserved` adicional la llamada a `SetInformationJobObject` falla con
