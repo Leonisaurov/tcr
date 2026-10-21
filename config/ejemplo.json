@@ -1,0 +1,21 @@
+﻿{
+  "$schema": "./esquema.config.json",
+
+  "Patterns": [
+    "opencode*",
+    "cline*",
+    "qodercli*"
+  ],
+
+  "CpuCores": 2,
+
+  "JobCpuPercent": 0,
+
+  "MemoryMaxMB": 0,
+
+  "Priority": "BelowNormal",
+
+  "ExcludeSession": true,
+
+  "WatchIntervalSec": 10
+}

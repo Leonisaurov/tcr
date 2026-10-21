@@ -1,0 +1,55 @@
+﻿{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/leonisaurov/tcr/esquema.config.json",
+  "title": "Configuracion de tcr",
+  "description": "Opciones que tcr guarda en %LOCALAPPDATA%\\tcr\\config.json y aplica en cada ejecucion.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "Patterns": {
+      "type": "array",
+      "description": "Patrones glob de los procesos a limitar. '*' comodin, '?' un caracter.",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1,
+      "examples": [["opencode*", "cline*", "qodercli*"]]
+    },
+    "CpuCores": {
+      "type": "integer",
+      "description": "Nucleos logicos que puede usar cada proceso. 0 = sin limite.",
+      "minimum": 0,
+      "maximum": 256,
+      "examples": [2]
+    },
+    "JobCpuPercent": {
+      "type": "integer",
+      "description": "Tope de CPU por porcentaje real via Job Object. Solo aplica a procesos que no pertenezcan ya a otro job. 0 = no usar.",
+      "minimum": 0,
+      "maximum": 100,
+      "examples": [15]
+    },
+    "MemoryMaxMB": {
+      "type": "integer",
+      "description": "Memoria maxima por proceso en MB. 0 = sin limite.",
+      "minimum": 0,
+      "examples": [1200]
+    },
+    "Priority": {
+      "type": "string",
+      "description": "Prioridad de Windows aplicada a los procesos limitados.",
+      "enum": ["Normal", "BelowNormal", "Idle"],
+      "examples": ["BelowNormal"]
+    },
+    "ExcludeSession": {
+      "type": "boolean",
+      "description": "Si es true, no limita la sesion actual ni sus procesos ancestros.",
+      "examples": [true]
+    },
+    "WatchIntervalSec": {
+      "type": "integer",
+      "description": "Segundos entre rondas del modo vigilancia, que reaplica los limites a los procesos nuevos.",
+      "minimum": 1,
+      "maximum": 3600,
+      "examples": [10]
+    }
+  }
+}

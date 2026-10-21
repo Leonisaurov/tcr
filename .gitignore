@@ -1,0 +1,26 @@
+﻿# Escribiendo en los logs de tcr
+
+# Ficheros de configuracion y registro generados en tiempo de ejecucion
+*.log
+config.local.json
+estado.json
+
+# Resultados de las pruebas
+tests/results/
+*.trx
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operativo
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Empaquetado
+*.zip
+*.nupkg
